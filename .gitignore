@@ -1,17 +1,31 @@
-# virtualenv / venv
-myenv/
-Lib/
-Scripts/
-Include/
-pyvenv.cfg
-
-# python cache
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
+*$py.class
 
-# logs / buffers
-buffer/
-*.log
+# Virtual env (если venv лежит в репозитории)
+№Lib/
+№Scripts/
+№Include/
+№pyvenv.cfg
+№*.venv/
+№.venv/
+№env/
+№venv/
 
-# environment
-.env
+# Build / packaging
+build/
+dist/
+release/
+*.spec
+*.egg-info/
+pip-wheel-metadata/
+
+# IDE / editors
+.vscode/
+.idea/
+tempCodeRunnerFile.py
+
+# OS
+.DS_Store
+Thumbs.db
