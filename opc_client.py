@@ -11,7 +11,9 @@ from opc_tags_list import (
 from json_buffer_manager import JSONBufferManager
 
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
-latest_analog_values = {} 
+last_opc_connection_state = None        # type: bool | None
+last_opc_disconnect_reason = None       # type: str | None
+latest_analog_values = {}
 event_queue = asyncio.Queue()
 analog_queue = asyncio.Queue()
 buffer = JSONBufferManager(
@@ -20,8 +22,10 @@ buffer = JSONBufferManager(
     max_records_per_file=JSON_BUFFER_MAX_RECORDS
 )
 opc_connected = False
-last_good_analog_values = {}                        # node_id -> last_good_value
-db_executor = ThreadPoolExecutor(max_workers=2)     # Пул потоков для БД операций
+# node_id -> last_good_value
+last_good_analog_values = {}
+# Пул потоков для БД операций
+db_executor = ThreadPoolExecutor(max_workers=2)
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -46,6 +50,7 @@ for logger_name in logging.root.manager.loggerDict:
         logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 # === КЛАССЫ И ФУНКЦИИ ===
 
+
 class SubscriptionHandler:
     async def datachange_notification(self, node, val, data):
         node_id = str(node)
@@ -56,7 +61,8 @@ class SubscriptionHandler:
         if node_id in EVENT_TAGS:
             out_val = str(val) if is_good else None
             await event_queue.put((node_id, out_val, is_good, status))
-            logger.info(f" [СОБЫТИЕ] {short_name:.<25} -> {out_val} | {status}")
+            logger.info(
+                f" [СОБЫТИЕ] {short_name:.<25} -> {out_val} | {status}")
 
         elif node_id in ANALOG_TAGS:
             if is_good:
@@ -65,6 +71,7 @@ class SubscriptionHandler:
             else:
                 # запоминаем факт bad, но последнее good не затираем
                 latest_analog_values[node_id] = (None, False, status)
+
 
 async def emit_opc_connection_state(connected: bool, reason: str = ""):
     """
@@ -101,7 +108,7 @@ async def emit_opc_connection_state(connected: bool, reason: str = ""):
 
     await event_queue.put((OPC_CONN_NODEID, val, is_good, status))
 
-                            
+
 def extract_quality(data) -> tuple[bool, str]:
     """
     Возвращает (is_good, status_str) из DataValue.StatusCode.
@@ -113,6 +120,7 @@ def extract_quality(data) -> tuple[bool, str]:
     except Exception as e:
         return False, f"UnknownStatus({e})"
 
+
 def safe_float(v):
     if v is None:
         return None
@@ -120,6 +128,7 @@ def safe_float(v):
         return float(v)
     except Exception:
         return None
+
 
 def _insert_to_db(table_name, data_to_insert, is_float=False):
     """Вспомогательная функция для записи в БД (работает в потоке)"""
@@ -144,23 +153,24 @@ def _insert_to_db(table_name, data_to_insert, is_float=False):
         return True, None, len(data_to_insert)
     except Exception as e:
         return False, str(e), 0
-    
+
+
 async def db_writer(queue, table_name, is_float=False):
     """Писатель в БД с поддержкой JSON буферизации при отказе"""
     global buffer
-    
+
     loop = asyncio.get_event_loop()
     consecutive_errors = 0
     max_consecutive_errors = 3
     last_error_logged = None
     db_connection_lost = False  # ← НОВОЕ: флаг потери связи
-    
+
     while True:
         batch = []
         try:
             item = await queue.get()
             batch.append(item)
-            
+
             while len(batch) < DB_BATCH_SIZE:
                 try:
                     item = queue.get_nowait()
@@ -175,10 +185,12 @@ async def db_writer(queue, table_name, is_float=False):
             success = True
             try:
                 if is_float:
-                     data_to_insert = [(str(nid), safe_float(val), bool(is_good), status) for nid, val, is_good, status in batch]
+                    data_to_insert = [(str(nid), safe_float(val), bool(
+                        is_good), status) for nid, val, is_good, status in batch]
                 else:
-                    data_to_insert = [(str(nid), None if val is None else str(val), bool(is_good), status) for nid, val, is_good, status in batch]
-                    
+                    data_to_insert = [(str(nid), None if val is None else str(val), bool(
+                        is_good), status) for nid, val, is_good, status in batch]
+
                 success, error, inserted = await loop.run_in_executor(
                     db_executor,
                     _insert_to_db,
@@ -186,33 +198,36 @@ async def db_writer(queue, table_name, is_float=False):
                     data_to_insert,
                     is_float
                 )
-                
+
                 if success:
                     consecutive_errors = 0
                     last_error_logged = None
-                    
+
                     # ← НОВОЕ: если связь была потеряна, сообщаем о восстановлении
                     if db_connection_lost:
                         logger.info(f"✅ Связь с SQL Server восстановлена")
                         db_connection_lost = False
-                    
+
                     logger.info(f" [БАЗА] {table_name}: +{len(batch)} строк ✓")
                 else:
                     consecutive_errors += 1
-                    
+
                     # ← ИЗМЕНЕНО: логируем потерю связи только один раз
                     if consecutive_errors == 1:
-                        logger.error(f"❌ Связь с SQL Server потеряна - буферизация активирована")
+                        logger.error(
+                            f"❌ Связь с SQL Server потеряна - буферизация активирована")
                         db_connection_lost = True
                         last_error_logged = error
-                    
+
                     # Буферизация в JSON при ошибке БД
                     for nid, val, is_good, status in batch:
                         if is_float:
-                            buffer.add_analog(str(nid), safe_float(val), is_good, status)
+                            buffer.add_analog(
+                                str(nid), safe_float(val), is_good, status)
                         else:
-                            buffer.add_event(str(nid), None if val is None else str(val), is_good, status)
-                    
+                            buffer.add_event(
+                                str(nid), None if val is None else str(val), is_good, status)
+
             except Exception as e:
                 logger.error(f"❌ Критическая ошибка в db_writer: {e}")
                 for nid, val in batch:
@@ -223,9 +238,10 @@ async def db_writer(queue, table_name, is_float=False):
             finally:
                 for _ in range(len(batch)):
                     queue.task_done()
-                
+
                 if not success:
                     await asyncio.sleep(1)
+
 
 async def periodic_analog_recorder():
     while True:
@@ -247,7 +263,9 @@ async def periodic_analog_recorder():
                 val = last_good_analog_values.get(node_id)
                 await analog_queue.put((node_id, val, False, "OPC Offline (stale)"))
 
-        logger.info(f" [АНАЛОГ] Срез отправлен в очередь: {len(ANALOG_TAGS)} тегов")
+        logger.info(
+            f" [АНАЛОГ] Срез отправлен в очередь: {len(ANALOG_TAGS)} тегов")
+
 
 async def sync_buffer_to_db():
     """Синхронизация буферизованных данных при восстановлении связи."""
@@ -256,34 +274,36 @@ async def sync_buffer_to_db():
     sync_attempts = 0
     last_error_logged = None
     sync_in_progress = False  # ← НОВОЕ: флаг синхронизации
-    
+
     while True:
         await asyncio.sleep(20)
-        
+
         stats = buffer.get_stats()
-        unsync_count = stats.get("events_unsynced", 0) + stats.get("analogs_unsynced", 0)
-        
+        unsync_count = stats.get("events_unsynced", 0) + \
+            stats.get("analogs_unsynced", 0)
+
         if unsync_count == 0:
             sync_attempts = 0
             last_error_logged = None
             sync_in_progress = False
             continue
-        
+
         sync_attempts += 1
-        
+
         # ← ИЗМЕНЕНО: показываем сообщение о начале синхронизации
         if sync_attempts == 1:
-            logger.info(f" [СИНХРО] Начало синхронизации буфера: {unsync_count} записей")
+            logger.info(
+                f" [СИНХРО] Начало синхронизации буфера: {unsync_count} записей")
             sync_in_progress = True
-        
+
         try:
             conn = pyodbc.connect(DB_DSN, timeout=5)
             cursor = conn.cursor()
-            
+
             buffer_data = buffer.get_unsync_data(limit=2000)
             synced_events = []
             synced_analogs = []
-            
+
             # Синхронизация событий
             if buffer_data["events"]:
                 try:
@@ -291,14 +311,16 @@ async def sync_buffer_to_db():
                         cursor.execute(
                             "INSERT INTO dbo.OpcEvents (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
                             "VALUES (?, ?, GETDATE(), ?, ?)",
-                            (record["node_id"], record.get("value"), 1 if record.get("is_good") else 0, record.get("status"))
+                            (record["node_id"], record.get("value"), 1 if record.get(
+                                "is_good") else 0, record.get("status"))
                         )
                         synced_events.append(record["timestamp"])
                     conn.commit()
-                    logger.info(f" [СИНХРО] ✓ События: +{len(buffer_data['events'])} записей")
+                    logger.info(
+                        f" [СИНХРО] ✓ События: +{len(buffer_data['events'])} записей")
                 except Exception as e:
                     conn.rollback()
-            
+
             # Синхронизация аналогов
             if buffer_data["analogs"]:
                 try:
@@ -306,57 +328,64 @@ async def sync_buffer_to_db():
                         cursor.execute(
                             "INSERT INTO dbo.OpcAnalog (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
                             "VALUES (?, ?, GETDATE(), ?, ?)",
-                            (record["node_id"], record.get("value"), 1 if record.get("is_good") else 0, record.get("status"))
-                )                        
+                            (record["node_id"], record.get("value"), 1 if record.get(
+                                "is_good") else 0, record.get("status"))
+                        )
                         synced_analogs.append(record["timestamp"])
                     conn.commit()
-                    logger.info(f" [СИНХРО] ✓ Аналоги: +{len(buffer_data['analogs'])} записей")
+                    logger.info(
+                        f" [СИНХРО] ✓ Аналоги: +{len(buffer_data['analogs'])} записей")
                 except Exception as e:
                     conn.rollback()
-            
+
             conn.close()
-            
+
             if synced_events or synced_analogs:
                 buffer.mark_synced(
                     event_ids=synced_events,
                     analog_ids=synced_analogs
                 )
-                
+
                 deleted = buffer.cleanup_synced()
                 if deleted > 0:
                     sync_attempts = 0
                     last_error_logged = None
-                    
+
                     # ← НОВОЕ: сообщение об успешной синхронизации
                     if sync_in_progress:
-                        logger.info(f"✅ Связь с SQL Server восстановлена - синхронизация завершена")
+                        logger.info(
+                            f"✅ Связь с SQL Server восстановлена - синхронизация завершена")
                         sync_in_progress = False
-                    
-                    logger.info(f" [JSON_БУФЕР] ✓ Синхронизировано и очищено: -{deleted} записей")
-                    
+
+                    logger.info(
+                        f" [JSON_БУФЕР] ✓ Синхронизировано и очищено: -{deleted} записей")
+
                     new_stats = buffer.get_stats()
                     logger.info(
                         f" [JSON_БУФЕР] Статус: "
                         f"{new_stats['usage_percent']}% "
                         f"({new_stats['current_size_mb']}MB / {new_stats['max_size_mb']}MB)"
                     )
-                    
+
         except Exception as e:
             if last_error_logged != str(e):
                 if sync_attempts <= 2:
-                    logger.warning(f" [СИНХРО] БД еще недоступна (попытка #{sync_attempts})")
+                    logger.warning(
+                        f" [СИНХРО] БД еще недоступна (попытка #{sync_attempts})")
                 elif sync_attempts == 3:
-                    logger.error(f" [СИНХРО] БД остается недоступной - данные буферизуются")
+                    logger.error(
+                        f" [СИНХРО] БД остается недоступной - данные буферизуются")
                 last_error_logged = str(e)
+
 
 async def monitor_buffer():
     """Мониторинг состояния буфера каждые 60 сек"""
     global buffer
-    
+
     while True:
         await asyncio.sleep(60)
         stats = buffer.get_stats()
-        
+
         status = "✓" if stats["buffer_enabled"] else "❌ ОТКЛЮЧЕН"
         logger.info(
             f" [JSON_БУФЕР] {status} | "
@@ -366,15 +395,16 @@ async def monitor_buffer():
             f"Ротир. файлов: {stats['rotated_files']}"
         )
 
+
 async def performance_monitor():
     """Мониторинг производительности системы"""
     while True:
         await asyncio.sleep(60)
-        
+
         event_queue_size = event_queue.qsize()
         analog_queue_size = analog_queue.qsize()
         buffer_stats = buffer.get_stats()
-        
+
         logger.info(
             f" [ПРОИЗВОДИТЕЛЬНОСТЬ] "
             f"Event Queue: {event_queue_size} | "
@@ -382,15 +412,16 @@ async def performance_monitor():
             f"Buffer: {buffer_stats['current_size_mb']}MB / "
             f"{buffer_stats['max_size_mb']}MB"
         )
-        
+
         # Предупреждение если очередь растет
         if event_queue_size > 1000 or analog_queue_size > 1000:
             logger.warning(" [ПРОИЗВОДИТЕЛЬНОСТЬ] ⚠️ Очередь переполняется!")
 
+
 async def health_check():
     """Проверка здоровья БД"""
     loop = asyncio.get_event_loop()
-    
+
     while True:
         await asyncio.sleep(300)  # каждые 5 минут
         try:
@@ -403,6 +434,7 @@ async def health_check():
             logger.info(" [ЗДОРОВЬЕ] БД доступна ✓")
         except Exception as e:
             logger.error(f" [ЗДОРОВЬЕ] ❌ БД недоступна: {e}")
+
 
 async def run_opc():
     global opc_connected
@@ -418,7 +450,8 @@ async def run_opc():
                 opc_connected = True
                 await emit_opc_connection_state(True)
 
-                logger.info("Считывание начальных значений аналоговых тегов...")
+                logger.info(
+                    "Считывание начальных значений аналоговых тегов...")
                 for nid in ANALOG_TAGS:
                     try:
                         node = client.get_node(nid)
@@ -430,9 +463,11 @@ async def run_opc():
 
                 handler = SubscriptionHandler()
                 sub = await client.create_subscription(1000, handler)
-                all_nodes = [client.get_node(nid) for nid in (EVENT_TAGS + ANALOG_TAGS)]
+                all_nodes = [client.get_node(nid)
+                             for nid in (EVENT_TAGS + ANALOG_TAGS)]
                 await sub.subscribe_data_change(all_nodes)
-                logger.info(f"✓ OPC подписка активна на {len(all_nodes)} тегов")
+                logger.info(
+                    f"✓ OPC подписка активна на {len(all_nodes)} тегов")
 
                 while True:
                     await asyncio.sleep(10)
@@ -444,14 +479,16 @@ async def run_opc():
             logger.warning("Реконнект OPC: %s: %s", type(e).__name__, e)
             await asyncio.sleep(5)
 
+
 async def main():
     """Главная функция - запуск всех корутин"""
     logger.info("=" * 60)
     logger.info("🚀 ЗАПУСК OPC-TO-SQL ПРИЛОЖЕНИЯ")
-    logger.info(f"   Tags: {len(EVENT_TAGS)} события + {len(ANALOG_TAGS)} аналогов")
+    logger.info(
+        f"   Tags: {len(EVENT_TAGS)} события + {len(ANALOG_TAGS)} аналогов")
     logger.info(f"   Buffer: {JSON_BUFFER_MAX_MB}MB")
     logger.info("=" * 60)
-    
+
     await asyncio.gather(
         run_opc(),
         periodic_analog_recorder(),

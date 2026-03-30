@@ -26,6 +26,9 @@ pip-wheel-metadata/
 .idea/
 tempCodeRunnerFile.py
 
+buffer/
+
 # OS
 .DS_Store
 Thumbs.db
+
