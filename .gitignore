@@ -1,0 +1,17 @@
+# virtualenv / venv
+myenv/
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# python cache
+__pycache__/
+*.py[cod]
+
+# logs / buffers
+buffer/
+*.log
+
+# environment
+.env
