@@ -4,15 +4,22 @@ OPC_USER = "admin"
 OPC_PASS = "admin"
 OPC_CONN_NODEID = "sys.opc.connection"
 
-DB_DSN = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=192.168.1.72,1433;"
-    "DATABASE=DB_NEW_TEST;"
-#    "UID=sa;"                           # ← SQL Server Login
-#    "PWD=your_password_here;"           # ← Пароль SQL Server
-    "Trusted_Connection=yes;"
-    "TrustServerCertificate=yes;"
-)
+import os as _os  # noqa: E402
+
+# SQL Server connection parameters for mssql-python (TDS driver).
+# Credentials can be overridden via environment variables DB_USER / DB_PASSWORD.
+# For Windows/Kerberos integrated auth leave user/password empty and set
+# trusted_connection="yes".
+DB_CONFIG = {
+    "server": "192.168.1.72",
+    "port": 1433,
+    "database": "DB_NEW_TEST",
+    "user": _os.environ.get("DB_USER", ""),           # e.g. "sa"
+    "password": _os.environ.get("DB_PASSWORD", ""),   # set DB_PASSWORD env var
+    "trusted_connection": "yes",                      # Windows/Kerberos auth
+    "trust_server_certificate": "yes",
+    # "encrypt": "yes",                               # uncomment to force TLS
+}
 
 # === СПИСКИ ТЕГОВ ===
 EVENT_TAGS = [

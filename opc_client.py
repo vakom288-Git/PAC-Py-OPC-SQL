@@ -1,14 +1,14 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import pyodbc
 from asyncua import Client, ua
 from opc_tags_list import (
-    EVENT_TAGS, ANALOG_TAGS, OPC_URL, OPC_USER, OPC_PASS, DB_DSN,
+    EVENT_TAGS, ANALOG_TAGS, OPC_URL, OPC_USER, OPC_PASS,
     ANALOG_SAVE_INTERVAL, DB_BATCH_SIZE, JSON_BUFFER_MAX_MB, JSON_BUFFER_MAX_RECORDS,
     OPC_CONN_NODEID
 )
 from json_buffer_manager import JSONBufferManager
+import db_mssql
 
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 last_opc_connection_state = None        # type: bool | None
@@ -40,7 +40,7 @@ logger.setLevel(logging.INFO)
 logging.getLogger("asyncua").setLevel(logging.ERROR)        # было WARNING
 logging.getLogger("uaprotocol").setLevel(logging.ERROR)     # было WARNING
 logging.getLogger("asyncio").setLevel(logging.ERROR)
-logging.getLogger("pyodbc").setLevel(logging.ERROR)
+logging.getLogger("mssql_python").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("cryptography").setLevel(logging.ERROR)
 
@@ -133,24 +133,20 @@ def safe_float(v):
 def _insert_to_db(table_name, data_to_insert, is_float=False):
     """Вспомогательная функция для записи в БД (работает в потоке)"""
     try:
-        conn = pyodbc.connect(DB_DSN, timeout=5)
-        cursor = conn.cursor()
-
+        rows = []
         for nid, val, is_good, status in data_to_insert:
             if is_float:
                 db_val = None if val is None else float(val)
             else:
                 db_val = None if val is None else str(val)
+            rows.append((str(nid), db_val, 1 if is_good else 0, str(status)))
 
-            cursor.execute(
-                f"INSERT INTO {table_name} (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
-                f"VALUES (?, ?, GETDATE(), ?, ?)",
-                (str(nid), db_val, 1 if is_good else 0, str(status))
-            )
-
-        conn.commit()
-        conn.close()
-        return True, None, len(data_to_insert)
+        db_mssql.executemany(
+            f"INSERT INTO {table_name} (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
+            f"VALUES (?, ?, GETDATE(), ?, ?)",
+            rows
+        )
+        return True, None, len(rows)
     except Exception as e:
         return False, str(e), 0
 
@@ -230,11 +226,11 @@ async def db_writer(queue, table_name, is_float=False):
 
             except Exception as e:
                 logger.error(f"❌ Критическая ошибка в db_writer: {e}")
-                for nid, val in batch:
+                for nid, val, is_good, status in batch:
                     if is_float:
-                        buffer.add_analog(nid, val)
+                        buffer.add_analog(str(nid), safe_float(val), bool(is_good), str(status))
                     else:
-                        buffer.add_event(nid, val)
+                        buffer.add_event(str(nid), None if val is None else str(val), bool(is_good), str(status))
             finally:
                 for _ in range(len(batch)):
                     queue.task_done()
@@ -297,7 +293,7 @@ async def sync_buffer_to_db():
             sync_in_progress = True
 
         try:
-            conn = pyodbc.connect(DB_DSN, timeout=5)
+            conn = db_mssql.get_connection(timeout=5)
             cursor = conn.cursor()
 
             buffer_data = buffer.get_unsync_data(limit=2000)
@@ -307,13 +303,17 @@ async def sync_buffer_to_db():
             # Синхронизация событий
             if buffer_data["events"]:
                 try:
+                    rows = [
+                        (record["node_id"], record.get("value"),
+                         1 if record.get("is_good") else 0, record.get("status"))
+                        for record in buffer_data["events"]
+                    ]
+                    cursor.executemany(
+                        "INSERT INTO dbo.OpcEvents (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
+                        "VALUES (?, ?, GETDATE(), ?, ?)",
+                        rows
+                    )
                     for record in buffer_data["events"]:
-                        cursor.execute(
-                            "INSERT INTO dbo.OpcEvents (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
-                            "VALUES (?, ?, GETDATE(), ?, ?)",
-                            (record["node_id"], record.get("value"), 1 if record.get(
-                                "is_good") else 0, record.get("status"))
-                        )
                         synced_events.append(record["timestamp"])
                     conn.commit()
                     logger.info(
@@ -324,13 +324,17 @@ async def sync_buffer_to_db():
             # Синхронизация аналогов
             if buffer_data["analogs"]:
                 try:
+                    rows = [
+                        (record["node_id"], record.get("value"),
+                         1 if record.get("is_good") else 0, record.get("status"))
+                        for record in buffer_data["analogs"]
+                    ]
+                    cursor.executemany(
+                        "INSERT INTO dbo.OpcAnalog (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
+                        "VALUES (?, ?, GETDATE(), ?, ?)",
+                        rows
+                    )
                     for record in buffer_data["analogs"]:
-                        cursor.execute(
-                            "INSERT INTO dbo.OpcAnalog (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
-                            "VALUES (?, ?, GETDATE(), ?, ?)",
-                            (record["node_id"], record.get("value"), 1 if record.get(
-                                "is_good") else 0, record.get("status"))
-                        )
                         synced_analogs.append(record["timestamp"])
                     conn.commit()
                     logger.info(
@@ -425,13 +429,11 @@ async def health_check():
     while True:
         await asyncio.sleep(300)  # каждые 5 минут
         try:
-            result = await loop.run_in_executor(
-                db_executor,
-                lambda: pyodbc.connect(DB_DSN)
-            )
-            if result:
-                result.close()
-            logger.info(" [ЗДОРОВЬЕ] БД доступна ✓")
+            ok = await loop.run_in_executor(db_executor, db_mssql.health_ping)
+            if ok:
+                logger.info(" [ЗДОРОВЬЕ] БД доступна ✓")
+            else:
+                logger.error(" [ЗДОРОВЬЕ] ❌ БД недоступна")
         except Exception as e:
             logger.error(f" [ЗДОРОВЬЕ] ❌ БД недоступна: {e}")
 

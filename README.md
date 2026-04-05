@@ -1,37 +1,121 @@
 # PAC-Py-OPC-SQL
 
+OPC UA → SQL Server bridge that subscribes to OPC tags and writes data into
+`dbo.OpcEvents` and `dbo.OpcAnalog` tables.
+
 ## Installation
-To install the PAC-Py-OPC-SQL project, run the following command:
+
 ```bash
-pip install pac-py-opc-sql
+pip install -r requirements.txt
 ```
+
+> **Note:** `mssql-python` ships a self-contained TDS driver — no ODBC driver
+> installation is required on the host.
 
 ## Configuration
-You need to configure the application to connect to your OPC and SQL databases. Configuration can be done in the `config_local.py` file.
 
-## SQL Authentication Examples
-### Development
-For development, use the following SQL connection parameters:
+All settings live in `opc_tags_list.py`.
+
+### OPC UA connection
+
 ```python
-SQLALCHEMY_DATABASE_URI = 'mysql+pymysql://user:password@localhost/dev_db'
+OPC_URL  = "opc.tcp://<host>:<port>"
+OPC_USER = "<username>"
+OPC_PASS = "<password>"
 ```
 
-### Production
-For production, the connection string might look like this:
+### SQL Server connection (`DB_CONFIG`)
+
+`DB_CONFIG` is a plain dict in `opc_tags_list.py`:
+
 ```python
-SQLALCHEMY_DATABASE_URI = 'mysql+pymysql://user:password@production_server/prod_db'
+DB_CONFIG = {
+    "server":                 "192.168.1.72",
+    "port":                   1433,
+    "database":               "DB_NEW_TEST",
+    "user":                   "",          # empty → Windows/Kerberos auth
+    "password":               "",          # see env-var section below
+    "trusted_connection":     "yes",       # Windows integrated auth
+    "trust_server_certificate": "yes",
+    # "encrypt": "yes",                    # uncomment to force TLS
+}
 ```
 
-## Local Secrets Configuration (`config_local.py`)
-The `config_local.py` file should contain sensitive information and should not be tracked by version control. It's used to override the default configurations.
+#### SQL Server Login (UID/PWD) instead of Windows auth
 
-## Data Definition Language (DDL)
-When using the application, you might need to setup your database schema with the following DDL commands:
+1. Set `trusted_connection` to `""` (empty string) in `DB_CONFIG`.
+2. Provide credentials via environment variables — **never hard-code secrets**:
+
+   ```bash
+   export DB_USER=sa
+   export DB_PASSWORD=YourStrongPassword
+   ```
+
+   The application reads them automatically:
+
+   ```python
+   "user":     os.environ.get("DB_USER", ""),
+   "password": os.environ.get("DB_PASSWORD", ""),
+   ```
+
+## T-SQL and User-Defined Functions
+
+Because `db_mssql.execute()` / `db_mssql.executemany()` accept arbitrary T-SQL,
+you can call any UDF that already exists in the target database:
+
+```python
+import db_mssql
+
+# Scalar UDF in a SELECT
+rows = db_mssql.execute("SELECT dbo.MyUdf(?)", ("input_value",))
+
+# UDF inside an INSERT
+db_mssql.execute(
+    "INSERT INTO dbo.OpcEvents (NodeId, [Value], [Timestamp], QualityIsGood, QualityStatus) "
+    "VALUES (?, dbo.NormaliseValue(?), GETDATE(), ?, ?)",
+    ("ns=1;s=MyTag", 3.14, 1, "Good")
+)
+```
+
+## Database Schema (DDL)
+
 ```sql
-CREATE TABLE example (
-    id INT PRIMARY KEY,
-    name VARCHAR(100)
+CREATE TABLE dbo.OpcEvents (
+    Id            INT IDENTITY PRIMARY KEY,
+    NodeId        NVARCHAR(256)  NOT NULL,
+    [Value]       NVARCHAR(MAX)  NULL,
+    [Timestamp]   DATETIME       NOT NULL DEFAULT GETDATE(),
+    QualityIsGood BIT            NOT NULL,
+    QualityStatus NVARCHAR(128)  NOT NULL
+);
+
+CREATE TABLE dbo.OpcAnalog (
+    Id            INT IDENTITY PRIMARY KEY,
+    NodeId        NVARCHAR(256)  NOT NULL,
+    [Value]       FLOAT          NULL,
+    [Timestamp]   DATETIME       NOT NULL DEFAULT GETDATE(),
+    QualityIsGood BIT            NOT NULL,
+    QualityStatus NVARCHAR(128)  NOT NULL
 );
 ```
 
-Please replace the placeholders with your actual database information and make sure to follow security best practices when managing your credentials.
+## Architecture
+
+```
+OPC UA Server
+    │
+    ▼  (asyncua subscription)
+SubscriptionHandler  ──► event_queue / analog_queue
+                              │
+                         db_writer()  ──► db_mssql.executemany()  ──► SQL Server
+                              │                  ▲
+                    (on DB error)           (reconnect)
+                              │
+                         JSONBufferManager  (./buffer/*.json)
+                              │
+                    sync_buffer_to_db()  ──► db_mssql  ──► SQL Server
+```
+
+- All blocking DB calls run in a `ThreadPoolExecutor` so the asyncio event loop
+  is never blocked.
+- `db_mssql.DBConnection` provides automatic commit/rollback as a context manager.
